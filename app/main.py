@@ -14,6 +14,7 @@ API:
   POST /api/plans/{id}/monitors     可行方案的失效监测点布设预览(只读计算)
   POST /api/plans/{id}/water-delivery
                                     可行方案的应急送水分配预览(只读计算)
+  POST /api/plans/{id}/spare-parts  可行方案的关阀作业备件包采购预览(只读计算)
   POST /api/demo                    恢复内置示例管网
   POST /api/clear                   清空管网输入
 """
@@ -32,8 +33,9 @@ from pydantic import BaseModel, Field, field_validator
 import database
 from demo import DEMO_NETWORK
 from solver import (MAX_VALVES, NetworkValidationError, plan_jumpers,
-                    plan_monitors, plan_sequence, plan_water_delivery,
-                    solve, solve_failover, solve_siting, solve_tradeoff)
+                    plan_monitors, plan_sequence, plan_spare_parts,
+                    plan_water_delivery, solve, solve_failover, solve_siting,
+                    solve_tradeoff)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -169,6 +171,17 @@ class WaterDeliveryIn(BaseModel):
     """
     demands: dict[str, Any] = Field(default_factory=dict)
     vehicles: list[WaterVehicleIn] = Field(default_factory=list)
+
+
+class SparePartsIn(BaseModel):
+    """关阀作业备件包采购预览录入: 逐计划阀门备件需求 + 至多 12 个采购包。
+
+    每枚计划关闭阀门一条 {备件种类: 正整数数量}; 每个采购包含唯一编号、
+    正整数价格及 {备件种类: 非负整数件数}。逐条校验(数量上限、编号唯一、
+    正/非负整数等)在 solver.plan_spare_parts 中进行, 以便返回明确错误。
+    """
+    valve_demands: dict[str, Any] = Field(default_factory=dict)
+    packages: list[dict[str, Any]] = Field(default_factory=list)
 
 
 @asynccontextmanager
@@ -421,6 +434,40 @@ def plan_water_delivery_preview(plan_id: int, req: WaterDeliveryIn) -> dict:
                                      plan.get("closed_valves", []),
                                      req.demands,
                                      [v.model_dump() for v in req.vehicles])
+    except NetworkValidationError as exc:
+        raise HTTPException(status_code=422, detail={"errors": exc.errors})
+    result["plan_id"] = plan_id
+    result["solver"] = plan.get("solver", "base")
+    return result
+
+
+@app.post("/api/plans/{plan_id}/spare-parts")
+def plan_spare_parts_preview(plan_id: int, req: SparePartsIn) -> dict:
+    """已保存可行方案的关阀作业备件包采购预览(独立 API, 只读计算)。
+
+    为方案中每枚计划关闭的阀门录入所需备件种类及正整数数量(无需备件的
+    阀门录空表), 合并各阀需求; 录入至多 12 个采购包(唯一编号 + 正整数
+    价格 + 按备件种类的非负整数件数, 每包只能买一次)。枚举全部采购包
+    组合, 选出覆盖全部需求的最低总价组合, 同价按采购包编号升序列表
+    字典序决胜, 返回采购清单与各类需求/到货/余量; 全部包仍不足时返回
+    逐类缺口; 无关阀备件需求时返回零费用空清单。不修改管网与历史方案。
+    """
+    with database.get_conn() as conn:
+        plan = database.get_plan(conn, plan_id)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="方案不存在")
+    if not plan.get("feasible"):
+        reason = plan.get("reason_code")
+        raise HTTPException(status_code=422, detail={"errors": [
+            f"方案 #{plan_id} 为不可行方案"
+            + (f"(reason_code: {reason})" if reason else "")
+            + ", 没有计划关闭的阀门, 不能规划关阀作业备件采购"
+        ]})
+    try:
+        result = plan_spare_parts(plan["network_snapshot"],
+                                  plan.get("closed_valves", []),
+                                  req.valve_demands,
+                                  req.packages)
     except NetworkValidationError as exc:
         raise HTTPException(status_code=422, detail={"errors": exc.errors})
     result["plan_id"] = plan_id

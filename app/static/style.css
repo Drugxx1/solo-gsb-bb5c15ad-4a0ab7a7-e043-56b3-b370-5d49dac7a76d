@@ -56,6 +56,9 @@ td input, td select {
 }
 td.act { width: 40px; text-align: center; }
 td.act button { border: none; background: none; color: #b3261e; font-size: 15px; padding: 0 4px; }
+.inner-table { margin-bottom: 6px; }
+.inner-table th, .inner-table td { border-bottom: none; padding: 2px 6px 2px 0; }
+.inner-table td input, .inner-table td select { width: 100%; }
 .add-row { margin-top: 8px; border-style: dashed; color: #1c7fb3; width: 100%; }
 .hidden { display: none !important; }
 .errors {
