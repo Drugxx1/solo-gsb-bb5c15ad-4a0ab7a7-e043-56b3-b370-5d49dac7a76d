@@ -337,6 +337,7 @@ function renderResult(r) {
     appendJumperPanel(r);
     appendMonitorPanel(r);
     appendWaterDeliveryPanel(r);
+    appendSparePartsPanel(r);
     drawCanvas();
     return;
   }
@@ -365,6 +366,7 @@ function renderResult(r) {
   appendJumperPanel(r);
   appendMonitorPanel(r);
   appendWaterDeliveryPanel(r);
+  appendSparePartsPanel(r);
   drawCanvas();
 }
 
@@ -1241,6 +1243,266 @@ function renderWaterResult(res, box) {
     <p class="role-name">合计: 需水 ${res.total_demand},
     最大可配送 ${res.delivered_total}, 总缺口 <b>${res.shortage_total}</b>,
     出车费总计 ${res.satisfied ? res.total_cost : "不产生（未选出可行车队）"}。</p>`;
+}
+
+// ---------- 关阀作业备件包采购预览 ----------
+// 入口: 可行方案详情(历史方案"查看"或刚求解出的方案)下方的预览卡片。
+// 只读计算, 不修改管网与历史方案。
+function appendSparePartsPanel(r) {
+  if (r.id == null) return; // 未入库结果不提供预览入口
+  const body = $("#result-body");
+  const card = document.createElement("div");
+  card.className = "card";
+  card.id = "spare-card";
+
+  if (!r.closed_valves.length) {
+    card.innerHTML = `
+      <h3>关阀作业备件包采购预览</h3>
+      <p class="role-name">该可行方案不关闭任何阀门, 无关阀作业备件需求,
+      无需采购备件包, 零费用空清单。</p>`;
+    body.appendChild(card);
+    return;
+  }
+
+  card.innerHTML = `
+    <h3>关阀作业备件包采购预览 <span class="role-name">(只读计算, 不修改管网与历史方案)</span></h3>
+    <p class="role-name">
+      为<b>每枚计划关闭的阀门</b>录入所需备件种类及<b>正整数数量</b>(留空/0 表示该阀不需要该类备件);
+      录入至多 12 个候选采购包, 每包有<b>唯一编号</b>、<b>正整数价格</b>与按备件种类列出的
+      <b>非负整数件数</b>, 每包只能买一次。合并各阀需求后, 系统选出覆盖全部需求的<b>最低总价</b>组合,
+      同价按<b>采购包编号升序列表</b>字典序决胜; 全部包仍不足时返回逐类缺口。
+    </p>
+    <h4>各阀备件需求</h4>
+    <table id="table-spare-demands"><thead id="spare-demand-head"></thead>
+      <tbody></tbody></table>
+    <p>
+      <input id="spare-part-name" placeholder="新增备件种类名, 如 gasket" style="width:14em">
+      <button id="btn-add-spare-part" class="secondary" type="button">＋ 添加备件种类列</button>
+      <span class="role-name" id="spare-part-hint"></span>
+    </p>
+    <h4>候选采购包（至多 12 个）</h4>
+    <table id="table-spare-packages"><thead id="spare-pkg-head"></thead>
+      <tbody></tbody></table>
+    <button id="btn-add-spare-pkg" class="add-row" type="button">＋ 添加候选采购包</button>
+    <p>
+      <button id="btn-spare-parts" type="button" class="primary">备件包采购预览求解</button>
+      <span class="role-name" id="spare-pkg-hint"></span>
+    </p>
+    <div id="spare-errors" class="errors hidden"></div>
+    <div id="spare-result"></div>`;
+  body.appendChild(card);
+
+  // 备件种类集合(动态列); 每包本地件数按种类保存
+  const partTypes = [];
+  const packages = []; // {id, price, counts: {partType: numberStr}}
+
+  function renderDemandTable() {
+    const head = card.querySelector("#spare-demand-head");
+    head.innerHTML = `<tr><th>计划阀门</th><th>绑定管段</th>${
+      partTypes.map((p) => `<th>${esc(p)}</th>`).join("")}
+    </tr>`;
+    card.querySelector("#table-spare-demands tbody").innerHTML =
+      r.closed_valves.map((id) => {
+        const v = state.valves.find((x) => x.id === id) || {};
+        return `<tr data-v="${esc(id)}">
+          <td><b>${esc(id)}</b></td>
+          <td>${esc(v.segment_id || "—")}</td>
+          ${partTypes.map((p) => `<td><input data-part="${esc(p)}"
+            type="number" min="0" step="1" value="" placeholder="0" style="width:5em"></td>`).join("")}
+        </tr>`;
+      }).join("");
+    card.querySelector("#spare-part-hint").textContent =
+      `备件种类 ${partTypes.length} 类: ${partTypes.map(esc).join(", ") || "（暂无）"}；` +
+      "数量为正整数, 留空视为 0";
+  }
+
+  function renderPkgRows() {
+    const head = card.querySelector("#spare-pkg-head");
+    head.innerHTML = `<tr><th>采购包编号</th><th>价格</th>${
+      partTypes.map((p) => `<th>${esc(p)}</th>`).join("")}<th></tr>`;
+    card.querySelector("#table-spare-packages tbody").innerHTML =
+      packages.map((pk, i) => `<tr data-i="${i}">
+        <td><input data-f="id" value="${esc(pk.id)}" placeholder="如 P1" style="width:7em"></td>
+        <td><input data-f="price" type="number" min="1" step="1" value="${esc(pk.price)}" style="width:6em"></td>
+        ${partTypes.map((p) => `<td><input data-c="${esc(p)}" type="number" min="0" step="1"
+          value="${esc(pk.counts[p] ?? 0)}" style="width:5em"></td>`).join("")}
+        <td class="act"><button data-del="${i}" title="删除">✕</button></td>
+      </tr>`).join("");
+    card.querySelector("#spare-pkg-hint").textContent =
+      `候选采购包 ${packages.length} 个（至多 12 个, 每包只能买一次）；件数为非负整数, 预览只读`;
+  }
+
+  function renderAllSpare() {
+    renderDemandTable();
+    renderPkgRows();
+  }
+
+  card.querySelector("#btn-add-spare-part").addEventListener("click", () => {
+    const inp = card.querySelector("#spare-part-name");
+    const name = inp.value.trim();
+    const errBox = card.querySelector("#spare-errors");
+    errBox.classList.add("hidden");
+    if (!name) {
+      errBox.innerHTML = "<b>请填写备件种类名</b>";
+      errBox.classList.remove("hidden");
+      return;
+    }
+    if (partTypes.includes(name)) {
+      errBox.innerHTML = `<b>备件种类 ${esc(name)} 已存在</b>`;
+      errBox.classList.remove("hidden");
+      return;
+    }
+    partTypes.push(name);
+    inp.value = "";
+    renderAllSpare();
+  });
+
+  card.querySelector("#btn-add-spare-pkg").addEventListener("click", () => {
+    const errBox = card.querySelector("#spare-errors");
+    if (packages.length >= 12) {
+      errBox.innerHTML = "<b>候选采购包最多 12 个</b>";
+      errBox.classList.remove("hidden");
+      return;
+    }
+    packages.push({ id: "", price: 1, counts: {} });
+    renderPkgRows();
+  });
+
+  // 需求表输入: 直接从 DOM 收集, 无需本地状态
+  card.querySelector("#table-spare-packages tbody").addEventListener("input", (e) => {
+    const tr = e.target.closest("tr");
+    if (!tr) return;
+    const i = Number(tr.dataset.i);
+    const f = e.target.dataset.f;
+    const c = e.target.dataset.c;
+    if (f === "id") packages[i].id = e.target.value;
+    else if (f === "price") packages[i].price = e.target.value;
+    else if (c !== undefined) packages[i].counts[c] = e.target.value;
+  });
+  card.querySelector("#table-spare-packages tbody").addEventListener("click", (e) => {
+    const btn = e.target.closest("button[data-del]");
+    if (!btn) return;
+    packages.splice(Number(btn.dataset.del), 1);
+    renderPkgRows();
+  });
+
+  card.querySelector("#btn-spare-parts").addEventListener("click", async () => {
+    const errBox = card.querySelector("#spare-errors");
+    const resBox = card.querySelector("#spare-result");
+    errBox.classList.add("hidden");
+    resBox.innerHTML = "";
+
+    const valveDemands = {};
+    card.querySelectorAll("#table-spare-demands tbody tr[data-v]").forEach((tr) => {
+      const items = {};
+      tr.querySelectorAll("input[data-part]").forEach((inp) => {
+        const v = inp.value.trim();
+        if (v !== "" && Number(v) > 0) items[inp.dataset.part] = Number(v);
+      });
+      valveDemands[tr.dataset.v] = items;
+    });
+    const payloadPkgs = packages
+      .filter((pk) => pk.id.trim())
+      .map((pk) => ({
+        id: pk.id.trim(),
+        price: pk.price === "" ? null : Number(pk.price),
+        items: Object.fromEntries(partTypes.map((p) =>
+          [p, pk.counts[p] === undefined || pk.counts[p] === "" ? 0 : Number(pk.counts[p])])),
+      }));
+    try {
+      const res = await api("POST", `/api/plans/${r.id}/spare-parts`, {
+        valve_demands: valveDemands,
+        packages: payloadPkgs,
+      });
+      renderSparePartsResult(res, resBox);
+    } catch (err) {
+      errBox.innerHTML = `<b>无法求解备件包采购预览:</b><ul>${
+        String(err.message).split("\n").map((e) => `<li>${esc(e)}</li>`).join("")}</ul>`;
+      errBox.classList.remove("hidden");
+    }
+  });
+
+  renderAllSpare();
+}
+
+function renderSparePartsResult(res, box) {
+  const partCols = res.part_types || [];
+  const valveRows = (res.valve_demands || []).map((vd) => {
+    const qty = new Map(vd.items.map((it) => [it.part_type, it.quantity]));
+    return `<tr><td><b>${esc(vd.valve_id)}</b></td>
+      <td>${esc(vd.segment_id)}</td>
+      ${partCols.map((p) => `<td>${qty.get(p) || 0}</td>`).join("")}
+      <td><b>${vd.items.reduce((s, it) => s + it.quantity, 0)}</b></td></tr>`;
+  }).join("");
+
+  const mergedRow = partCols.map((p) => `<td><b>${esc(res.merged_demand[p])}</b></td>`).join("");
+
+  const pkgRows = (res.selected_packages || []).map((pk) => {
+    const qty = new Map(pk.items.map((it) => [it.part_type, it.quantity]));
+    return `<tr><td><b>${esc(pk.id)}</b></td><td>${esc(pk.price)}</td>
+      ${partCols.map((p) => `<td>${qty.get(p) || 0}</td>`).join("")}</tr>`;
+  }).join("");
+
+  const summaryRows = (res.part_summary || []).map((s) => `
+    <tr><td><b>${esc(s.part_type)}</b></td>
+      <td>${s.demand}</td>
+      <td>${s.arrival}</td>
+      <td>${s.surplus > 0
+        ? `<span class="tag supplied">${s.surplus}</span>`
+        : '<span class="tag dead">0</span>'}</td>
+      <td>${s.shortage > 0
+        ? `<span class="tag leak_not_isolated">${s.shortage}</span>`
+        : '<span class="tag supplied">0</span>'}</td>
+    </tr>`).join("");
+
+  if (res.empty) {
+    box.innerHTML = `
+      <div class="banner ok">
+        <span class="big">✓ 零费用空清单</span>${esc(res.message)}
+        <br><small>本结果为只读预览, 未修改管网与历史方案。</small>
+      </div>`;
+    return;
+  }
+
+  const banner = res.satisfied
+    ? `<div class="banner ok">
+        <span class="big">✓ 采购清单（${res.selected_package_ids.length} 个包）</span>${esc(res.message)}
+        <br><small>共枚举 ${res.combination_count} 个采购包组合, 其中
+        ${res.feasible_combination_count} 个可覆盖全部备件需求。
+        本结果为只读预览, 未修改管网与历史方案。</small>
+      </div>
+      <h4>采购清单（编号升序, 总价合计 ${res.total_price}）</h4>
+      <table><thead><tr><th>采购包</th><th>价格</th>
+        ${partCols.map((p) => `<th>${esc(p)}</th>`).join("")}
+      </tr></thead><tbody>${pkgRows ||
+        `<tr><td colspan="${partCols.length + 2}" class="role-name">无采购包</td></tr>`}
+      </tbody></table>
+      <p class="role-name">优化次序: 先最小化总价合计, 同价按采购包编号升序列表字典序决胜;
+      每包只能买一次。</p>`
+    : `<div class="banner bad">
+        <span class="big">✗ 全部采购包仍不足</span>${esc(res.message)}
+        <br><small>本结果为只读预览, 未修改管网与历史方案。</small>
+      </div>`;
+
+  box.innerHTML = `
+    ${banner}
+    <h4>各阀备件需求（合并前）</h4>
+    <table><thead><tr><th>阀门</th><th>绑定管段</th>
+      ${partCols.map((p) => `<th>${esc(p)}</th>`).join("")}<th>本阀合计</th>
+    </tr></thead><tbody>${valveRows}</tbody></table>
+    <h4>各类需求 / 到货 / 余量 / 缺口</h4>
+    <table><thead><tr>
+      <th>备件种类</th><th>需求</th><th>到货</th><th>余量</th><th>缺口</th>
+    </tr></thead><tbody>${summaryRows}</tbody>
+    <tfoot><tr><td><b>合计</b></td>
+      <td><b>${res.total_demand}</b></td>
+      <td><b>${res.arrival_total}</b></td>
+      <td><b>${res.surplus_total}</b></td>
+      <td><b>${res.shortage_total}</b></td>
+    </tr></tfoot></table>
+    <p class="role-name">合并需求: ${partCols.map((p) =>
+      `${esc(p)}=${res.merged_demand[p]}`).join(", ")}；
+    总价总计 ${res.satisfied ? res.total_price : "不产生（未选出可覆盖组合）"}。</p>`;
 }
 
 // ---------- 历史 ----------

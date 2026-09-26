@@ -61,6 +61,15 @@ raw_vehicles): 已保存可行方案的应急送水分配预览(只读计算)。
 量(最大流)与总缺口; 没有断水需求点时返回空调度。选中组合内各车向各
 点的配送量按(需求点编号, 车辆编号)双关键字贪心确定, 结果唯一。
 
+以及 plan_spare_parts(snapshot, closed_valves, raw_valve_demands,
+raw_packages): 已保存可行方案的关阀作业备件包采购预览(只读计算)。
+为每枚计划关闭的阀门录入所需备件种类及正整数数量, 合并各阀需求;
+录入至多 12 个候选采购包, 每包含唯一编号、正整数价格与按备件种类
+列出的非负整数件数, 每包只能买一次。枚举全部采购包组合(≤2¹²),
+选出能覆盖全部备件需求且总价最低的组合, 同价按采购包编号升序列表
+字典序决胜, 返回采购清单与各类需求/到货/余量; 全部包仍不足时返回
+逐类缺口; 无关阀备件需求时返回零费用空清单。
+
 阀门最多 14 个, 枚举全部 2^V 个子集(V<=14 => 16384), 对每个子集做
 BFS 连通性检查即可, 简单且确定。
 """
@@ -74,6 +83,7 @@ MAX_VALVES = 14
 MAX_CANDIDATES = 6
 MAX_MONITOR_CANDIDATES = 12
 MAX_WATER_VEHICLES = 6
+MAX_SPARE_PACKAGES = 12
 
 
 class NetworkValidationError(ValueError):
@@ -869,6 +879,13 @@ class SequenceInputError(NetworkValidationError):
 def _positive_int(value: Any) -> int | None:
     """严格正整数: 拒绝 bool/浮点/字符串/0/负数, 合法时返回 int。"""
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
+def _nonneg_int(value: Any) -> int | None:
+    """严格非负整数: 拒绝 bool/浮点/字符串/负数, 0 合法, 合法时返回 int。"""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         return None
     return value
 
@@ -2043,5 +2060,301 @@ def plan_water_delivery(snapshot: dict[str, Any],
         "total_demand": total_demand,
         "shortage_total": shortage_total,
         "total_cost": None,
+        "message": message,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 关阀作业备件包采购预览(只读计算, 针对已保存的可行方案)
+# ---------------------------------------------------------------------------
+
+def plan_spare_parts(snapshot: dict[str, Any],
+                     closed_valves: list[str],
+                     raw_valve_demands: Any,
+                     raw_packages: Any) -> dict[str, Any]:
+    """已保存可行方案的关阀作业备件包采购预览(只读计算, 不改方案与管网)。
+
+    为每枚计划关闭的阀门录入所需备件种类及正整数数量(合并各阀需求得到
+    各类总需求); 录入至多 MAX_SPARE_PACKAGES 个候选采购包, 每包含唯一
+    编号、正整数价格与按备件种类列出的非负整数件数, 每包只能买一次。
+    枚举全部采购包组合(2^包数), 选出对每种备件的到货件数都不少于需求
+    且总价最低的组合; 同价时按采购包编号升序列表字典序决胜。全部包仍
+    不足以覆盖时返回逐类缺口(取全部包参与的到货量); 合并后无任何备件
+    需求时返回零费用空清单。
+    """
+    try:
+        nodes, segments, valves = validate_network(snapshot)
+    except NetworkValidationError as exc:
+        raise NetworkValidationError(
+            ["方案快照数据不合法: " + e for e in exc.errors]) from exc
+
+    errors: list[str] = []
+
+    # ---- 计划关闭阀门必须存在于快照管网中 ----
+    valve_by_id = {vl["id"]: vl for vl in valves}
+    plan_valves = sorted(dict.fromkeys(
+        _norm_id(v) for v in (closed_valves or [])))
+    for vid in plan_valves:
+        if vid not in valve_by_id:
+            errors.append(f"方案关闭的阀门 {vid} 不存在于方案快照的管网中")
+
+    # ---- 各阀备件需求录入校验: 键必须恰好是计划阀门, 值为种类->正整数 ----
+    valve_demands: dict[str, dict[str, int]] = {}
+    if raw_valve_demands is None:
+        raw_valve_demands = {}
+    if not isinstance(raw_valve_demands, dict):
+        errors.append("valve_demands 必须是以阀门编号为键的对象")
+        raw_valve_demands = {}
+    plan_set = set(plan_valves)
+    missing_v = [v for v in plan_valves if v not in raw_valve_demands]
+    extra_v = sorted(str(k) for k in raw_valve_demands if k not in plan_set)
+    if missing_v:
+        errors.append("缺少计划阀门的备件需求: " + ", ".join(missing_v))
+    if extra_v:
+        errors.append("提供了非计划阀门的备件需求(多余编号): "
+                      + ", ".join(extra_v))
+    # 合并各类总需求(同一种类在同一阀内重复出现时累加)
+    merged: dict[str, int] = {}
+    for vid in plan_valves:
+        raw_items = raw_valve_demands.get(vid)
+        items: dict[str, int] = {}
+        if raw_items is None:
+            pass  # 该阀缺少整行录入, 已在上面记 missing
+        elif not isinstance(raw_items, dict):
+            errors.append(f"阀门 {vid} 的备件需求必须是以备件种类为键的对象")
+        else:
+            for kind, qty in raw_items.items():
+                kid = _norm_id(kind)
+                if not kid:
+                    errors.append(f"阀门 {vid}: 备件种类名称不能为空")
+                    continue
+                val = _positive_int(qty)
+                if val is None:
+                    errors.append(
+                        f"阀门 {vid} 的备件 {kid} 数量必须是正整数, "
+                        f"收到: {qty!r}")
+                    continue
+                items[kid] = items.get(kid, 0) + val
+                merged[kid] = merged.get(kid, 0) + val
+        valve_demands[vid] = dict(sorted(items.items()))
+    part_ids = sorted(merged)
+
+    # ---- 合并后无任何备件需求: 录入合法后返回零费用空清单 ----
+    if not part_ids:
+        if errors:
+            raise NetworkValidationError(errors)
+        return {
+            "ok": True,
+            "satisfied": True,
+            "empty": True,
+            "closed_valves": plan_valves,
+            "valve_demands": {v: valve_demands.get(v, {})
+                              for v in plan_valves},
+            "merged_demand": {},
+            "part_types": [],
+            "candidate_count": len(raw_packages)
+            if isinstance(raw_packages, list) else 0,
+            "selected_package_ids": [],
+            "selected_packages": [],
+            "part_summary": [],
+            "arrival_total": 0,
+            "total_demand": 0,
+            "surplus_total": 0,
+            "shortage_total": 0,
+            "total_price": 0,
+            "combination_count": 1,
+            "feasible_combination_count": 1,
+            "message": ("关阀作业备件包采购预览(只读, 不修改管网与历史方案): "
+                        "计划关闭的阀门均无备件需求, 无需采购, "
+                        "返回零费用空清单。"),
+        }
+
+    # ---- 候选采购包录入校验: 至多 12 个 / 唯一编号 / 正整数价格 /
+    #        按种类列出非负整数件数(只允许录入已需求的备件种类) ----
+    if raw_packages is None:
+        raw_packages = []
+    if not isinstance(raw_packages, list):
+        raise NetworkValidationError(errors + ["packages 必须是数组"])
+    if len(raw_packages) > MAX_SPARE_PACKAGES:
+        errors.append(f"候选采购包数量为 {len(raw_packages)}, "
+                      f"超过上限 {MAX_SPARE_PACKAGES} 个")
+    packages: list[dict[str, Any]] = []
+    seen_pkg: set[str] = set()
+    for i, pk in enumerate(raw_packages):
+        if not isinstance(pk, dict):
+            errors.append(f"采购包 #{i + 1}: 必须是对象")
+            continue
+        pid = _norm_id(pk.get("id"))
+        label = pid or f"#{i + 1}"
+        if not pid:
+            errors.append(f"采购包 #{i + 1}: 缺少采购包编号")
+        elif pid in seen_pkg:
+            errors.append(f"采购包编号重复: {pid}")
+        seen_pkg.add(pid)
+        price = _positive_int(pk.get("price"))
+        if price is None:
+            errors.append(f"采购包 {label}: 价格必须是正整数, "
+                          f"收到: {pk.get('price')!r}")
+        raw_items = pk.get("items", {})
+        item_counts: dict[str, int] = {}
+        if not isinstance(raw_items, dict):
+            errors.append(f"采购包 {label}: 备件件数必须是以备件种类为键的对象")
+        else:
+            for kind, qty in raw_items.items():
+                kid = _norm_id(kind)
+                if not kid:
+                    errors.append(f"采购包 {label}: 备件种类名称不能为空")
+                    continue
+                if kid not in merged:
+                    errors.append(
+                        f"采购包 {label}: 备件种类 {kid} 不在各阀合并后的"
+                        f"备件需求中(多余种类)")
+                    continue
+                val = _nonneg_int(qty)
+                if val is None:
+                    errors.append(
+                        f"采购包 {label} 的备件 {kid} 件数必须是非负整数, "
+                        f"收到: {qty!r}")
+                    continue
+                item_counts[kid] = item_counts.get(kid, 0) + val
+        packages.append({"id": pid, "price": price, "items": item_counts})
+    if errors:
+        raise NetworkValidationError(errors)
+
+    m = len(packages)
+    # 每种备件在每个采购包中的件数向量(按 part_ids 顺序)
+    vec = [[pk["items"].get(kid, 0) for kid in part_ids] for pk in packages]
+    demand_vec = [merged[kid] for kid in part_ids]
+    total_demand = sum(demand_vec)
+
+    # ---- 枚举全部采购包组合: 逐类件数覆盖需求, 比(总价, 编号升序列表) ----
+    size = 1 << m
+    best_key: tuple[int, tuple[str, ...]] | None = None
+    best_bits = 0
+    feasible_combinations = 0
+    for bits in range(size):
+        arrival = [0] * len(part_ids)
+        price_sum = 0
+        b = bits
+        while b:
+            low = b & -b
+            j = low.bit_length() - 1
+            vj = vec[j]
+            for t in range(len(part_ids)):
+                arrival[t] += vj[t]
+            price_sum += packages[j]["price"]
+            b ^= low
+        covers = all(arrival[t] >= demand_vec[t]
+                     for t in range(len(part_ids)))
+        if covers:
+            feasible_combinations += 1
+            ids = tuple(sorted(packages[j]["id"]
+                               for j in range(m) if (bits >> j) & 1))
+            key = (price_sum, ids)
+            if best_key is None or key < best_key:
+                best_key, best_bits = key, bits
+
+    label_of_valve = {vl["id"]: vl.get("label", vl["id"]) for vl in valves}
+
+    def part_summary_of(arrival: list[int]) -> list[dict[str, Any]]:
+        return [{
+            "part_type": kid,
+            "demand": demand_vec[t],
+            "arrival": arrival[t],
+            "surplus": max(0, arrival[t] - demand_vec[t]),
+            "shortage": max(0, demand_vec[t] - arrival[t]),
+        } for t, kid in enumerate(part_ids)]
+
+    valve_demand_out = [{
+        "valve_id": vid,
+        "label": label_of_valve.get(vid, vid),
+        "segment_id": valve_by_id[vid]["segment_id"],
+        "items": [{"part_type": kid, "quantity": qty}
+                  for kid, qty in sorted(valve_demands.get(vid, {}).items())],
+    } for vid in plan_valves]
+
+    if feasible_combinations:
+        # ---- 存在覆盖组合: 取最优采购清单 ----
+        sel_idx = sorted((j for j in range(m) if (best_bits >> j) & 1),
+                         key=lambda j: packages[j]["id"])
+        arrival = [0] * len(part_ids)
+        for j in sel_idx:
+            for t in range(len(part_ids)):
+                arrival[t] += vec[j][t]
+        selected_packages = [{
+            "id": packages[j]["id"],
+            "price": packages[j]["price"],
+            "items": [{"part_type": kid, "quantity": vec[j][t]}
+                      for t, kid in enumerate(part_ids)],
+        } for j in sel_idx]
+        selected_ids = [pk["id"] for pk in selected_packages]
+        total_price = sum(pk["price"] for pk in selected_packages)
+        summary = part_summary_of(arrival)
+        arrival_total = sum(arrival)
+        surplus_total = sum(row["surplus"] for row in summary)
+        message = (
+            f"关阀作业备件包采购预览(只读, 不修改管网与历史方案): 采购 "
+            f"{len(selected_ids)} 个备件包"
+            f"({', '.join(selected_ids) or '无'}), 总价合计 {total_price}, "
+            f"已覆盖全部 {len(part_ids)} 类备件需求(共需 {total_demand} 件, "
+            f"到货 {arrival_total} 件, 余量合计 {surplus_total} 件)。")
+        return {
+            "ok": True,
+            "satisfied": True,
+            "empty": False,
+            "closed_valves": plan_valves,
+            "valve_demands": valve_demand_out,
+            "merged_demand": merged,
+            "part_types": part_ids,
+            "candidate_count": m,
+            "combination_count": size,
+            "feasible_combination_count": feasible_combinations,
+            "selected_package_ids": selected_ids,
+            "selected_packages": selected_packages,
+            "part_summary": summary,
+            "arrival_total": arrival_total,
+            "total_demand": total_demand,
+            "surplus_total": surplus_total,
+            "shortage_total": 0,
+            "total_price": total_price,
+            "message": message,
+        }
+
+    # ---- 全部采购包仍不足: 全部包参与的到货量与逐类缺口 ----
+    arrival = [0] * len(part_ids)
+    for vj in vec:
+        for t in range(len(part_ids)):
+            arrival[t] += vj[t]
+    summary = part_summary_of(arrival)
+    arrival_total = sum(arrival)
+    shortage_total = sum(row["shortage"] for row in summary)
+    surplus_total = sum(row["surplus"] for row in summary)
+    shortage_parts = [row["part_type"] for row in summary
+                      if row["shortage"] > 0]
+    message = (
+        f"关阀作业备件包采购预览(只读, 不修改管网与历史方案): 全部 {m} 个"
+        f"候选采购包各买一件仍无法覆盖备件需求 — 共需 {total_demand} 件, "
+        f"最多到货 {arrival_total} 件, 总缺口 {shortage_total} 件"
+        f"(缺口种类: {', '.join(shortage_parts)}); 请增加候选采购包。")
+    return {
+        "ok": False,
+        "reason_code": "INSUFFICIENT_PACKAGES",
+        "satisfied": False,
+        "empty": False,
+        "closed_valves": plan_valves,
+        "valve_demands": valve_demand_out,
+        "merged_demand": merged,
+        "part_types": part_ids,
+        "candidate_count": m,
+        "combination_count": size,
+        "feasible_combination_count": 0,
+        "selected_package_ids": [],
+        "selected_packages": [],
+        "part_summary": summary,
+        "arrival_total": arrival_total,
+        "total_demand": total_demand,
+        "surplus_total": surplus_total,
+        "shortage_total": shortage_total,
+        "total_price": None,
         "message": message,
     }
